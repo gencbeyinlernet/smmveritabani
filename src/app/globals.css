@@ -1,0 +1,67 @@
+@import "tailwindcss";
+
+/* ===== Marka renkleri (Novarge logosundan) ===== */
+@theme {
+  --color-marka-50: #eef2fa;
+  --color-marka-100: #dbe3f3;
+  --color-marka-200: #b7c6e6;
+  --color-marka-500: #3b5aa8;
+  --color-marka-600: #2c4688;
+  --color-marka-700: #22376c;
+  --color-marka-800: #1b2b54;
+  --color-marka-900: #141f3d;
+  --color-vurgu-50: #fff1ef;
+  --color-vurgu-100: #ffe0dc;
+  --color-vurgu-500: #ef4a3c;
+  --color-vurgu-600: #d93a2d;
+  --font-sans: var(--font-inter), "Segoe UI", system-ui, sans-serif;
+}
+
+body {
+  background: #f5f7fb;
+  color: #1e293b;
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ===== Ortak bileşen görünümleri ===== */
+.girdi {
+  @apply w-full rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-sm text-slate-800 shadow-sm outline-none transition placeholder:text-slate-400 focus:border-marka-500 focus:ring-4 focus:ring-marka-100;
+}
+.dugme {
+  @apply inline-flex items-center justify-center gap-2 rounded-lg bg-marka-700 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-marka-800 focus-visible:ring-4 focus-visible:ring-marka-200 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-60;
+}
+.dugme-vurgu {
+  @apply inline-flex items-center justify-center gap-2 rounded-lg bg-vurgu-500 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-vurgu-600 focus-visible:ring-4 focus-visible:ring-vurgu-100 active:scale-[0.98];
+}
+.dugme-ikincil {
+  @apply inline-flex items-center justify-center gap-2 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 shadow-sm transition hover:border-slate-300 hover:bg-slate-50 active:scale-[0.98];
+}
+.kart {
+  @apply rounded-2xl border border-slate-200/80 bg-white shadow-[0_1px_3px_rgba(16,24,40,0.06)];
+}
+.tablo th {
+  @apply sticky top-0 bg-slate-50 px-4 py-3 text-left text-[11px] font-semibold uppercase tracking-wider text-slate-500;
+}
+.tablo td {
+  @apply border-t border-slate-100 px-4 py-3 text-sm text-slate-700;
+}
+.tablo tbody tr {
+  @apply transition-colors hover:bg-marka-50/50;
+}
+.rozet {
+  @apply inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-medium;
+}
+
+/* Sayfa geçişlerinde yumuşak beliriş */
+@keyframes belir {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+.belir {
+  animation: belir 0.35s ease-out both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .belir { animation: none; }
+  * { transition: none !important; }
+}

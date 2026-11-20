@@ -1,0 +1,226 @@
+﻿-- =====================================================================
+-- MÜŞTERİ VE EVRAK TAKİP – SUPABASE VERİTABANI KURULUMU
+-- Nasıl çalıştırılır: Supabase > SQL Editor > New query
+-- Bu dosyanın TAMAMINI yapıştırın ve Run düğmesine basın.
+-- Birden fazla çalıştırılırsa zarar vermez.
+-- =====================================================================
+
+create extension if not exists pgcrypto with schema extensions;
+
+-- 1) MÜŞTERİLER
+create table if not exists public.musteriler (
+  id                uuid primary key default gen_random_uuid(),
+  unvan             text not null check (length(trim(unvan)) > 0),
+  vergi_no          text not null default '',
+  sektor            text not null default '',
+  mukellefiyet_turu text not null default '',
+  yetkili           text not null default '',
+  telefon           text not null default '' check (telefon ~ '^[0-9]*$'),
+  eposta            text not null default '',
+  aylik_ucret       numeric(12,2) not null default 0 check (aylik_ucret >= 0),
+  beyannameler      text[] not null default array['KDV','MUHTASAR','GECICI']
+                    check (beyannameler <@ array['KDV','MUHTASAR','GECICI']),
+  olusturulma       timestamptz not null default now()
+);
+
+-- 2) AYLIK EVRAK TAKİBİ (her müşteri + ay için tek kayıt)
+create table if not exists public.evraklar (
+  musteri_id   uuid not null references public.musteriler(id) on delete cascade,
+  donem        text not null check (donem ~ '^[0-9]{4}-(0[1-9]|1[0-2])$'),  -- ör. 2026-11
+  geldi        boolean not null default false,
+  gelis_tarihi date,
+  guncelleme   timestamptz not null default now(),
+  primary key (musteri_id, donem),
+  check (not geldi or gelis_tarihi is not null)
+);
+
+-- 3) BEYANNAME DURUMLARI (her müşteri + tür + dönem için tek kayıt)
+create table if not exists public.beyanname_kayitlari (
+  musteri_id uuid not null references public.musteriler(id) on delete cascade,
+  tur        text not null check (tur in ('KDV','MUHTASAR','GECICI')),
+  donem      text not null,  -- KDV/Muhtasar: 2026-11, Geçici Vergi: 2026-Q3
+  durum      text not null default 'Bekliyor'
+             check (durum in ('Bekliyor','Hazırlandı','Onaylandı','Gönderildi')),
+  guncelleme timestamptz not null default now(),
+  primary key (musteri_id, tur, donem),
+  check (
+    (tur =  'GECICI' and donem ~ '^[0-9]{4}-Q[1-3]$') or
+    (tur <> 'GECICI' and donem ~ '^[0-9]{4}-(0[1-9]|1[0-2])$')
+  )
+);
+
+-- 4) KULLANICI PROFİLLERİ (kullanıcı adı, onay ve yönetici bilgisi)
+create table if not exists public.profiller (
+  id            uuid primary key references auth.users(id) on delete cascade,
+  kullanici_adi text not null unique,
+  onayli        boolean not null default false,
+  yonetici      boolean not null default false,
+  olusturulma   timestamptz not null default now()
+);
+
+-- 5) YARDIMCI KONTROLLER
+create or replace function public.onayli_mi() returns boolean
+language sql stable security definer set search_path = public as $$
+  select coalesce((select onayli from public.profiller where id = auth.uid()), false);
+$$;
+
+create or replace function public.yonetici_mi() returns boolean
+language sql stable security definer set search_path = public as $$
+  select coalesce((select onayli and yonetici from public.profiller where id = auth.uid()), false);
+$$;
+
+-- 6) YENİ KAYIT OLAN HER KULLANICI İÇİN PROFİL OLUŞTUR
+--    Yeni kullanıcılar ONAYSIZ başlar; yönetici onaylayana kadar veri göremez.
+--    İstisna: henüz hiç yönetici yokken 'novarge' adıyla kayıt olan hesap
+--    otomatik olarak onaylı yönetici olur.
+create or replace function public.yeni_kullanici_profili() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare
+  ad   text := lower(coalesce(new.raw_user_meta_data->>'kullanici_adi', split_part(new.email, '@', 1)));
+  ilk  boolean := ad = 'novarge' and not exists (select 1 from public.profiller where yonetici);
+begin
+  insert into public.profiller (id, kullanici_adi, onayli, yonetici)
+  values (new.id, ad, ilk, ilk);
+  return new;
+end;
+$$;
+
+drop trigger if exists kullanici_olusunca on auth.users;
+create trigger kullanici_olusunca
+  after insert on auth.users
+  for each row execute function public.yeni_kullanici_profili();
+
+-- 7) SATIR DÜZEYİNDE GÜVENLİK (RLS)
+--    Veri tablolarını yalnızca giriş yapmış VE onaylanmış kullanıcılar görür/değiştirir.
+alter table public.musteriler          enable row level security;
+alter table public.evraklar            enable row level security;
+alter table public.beyanname_kayitlari enable row level security;
+alter table public.profiller           enable row level security;
+
+drop policy if exists "onayli kullanicilar" on public.musteriler;
+create policy "onayli kullanicilar" on public.musteriler
+  for all to authenticated using (public.onayli_mi()) with check (public.onayli_mi());
+
+drop policy if exists "onayli kullanicilar" on public.evraklar;
+create policy "onayli kullanicilar" on public.evraklar
+  for all to authenticated using (public.onayli_mi()) with check (public.onayli_mi());
+
+drop policy if exists "onayli kullanicilar" on public.beyanname_kayitlari;
+create policy "onayli kullanicilar" on public.beyanname_kayitlari
+  for all to authenticated using (public.onayli_mi()) with check (public.onayli_mi());
+
+-- Herkes kendi profilini görür; yönetici herkesi görür ve değiştirir.
+drop policy if exists "kendi profili veya yonetici" on public.profiller;
+create policy "kendi profili veya yonetici" on public.profiller
+  for select to authenticated using (id = auth.uid() or public.yonetici_mi());
+
+drop policy if exists "yonetici gunceller" on public.profiller;
+create policy "yonetici gunceller" on public.profiller
+  for update to authenticated
+  using (public.yonetici_mi() and id <> auth.uid())
+  with check (public.yonetici_mi() and id <> auth.uid());
+
+-- Giriş yapmamış ziyaretçilerin hiçbir tabloya erişimi yok.
+revoke all on public.musteriler, public.evraklar, public.beyanname_kayitlari, public.profiller from anon;
+
+-- 8) YÖNETİCİ İŞLEMLERİ: şifre sıfırlama ve kullanıcı silme
+create or replace function public.yonetici_sifre_degistir(hedef uuid, yeni_sifre text) returns void
+language plpgsql security definer set search_path = public, extensions as $$
+begin
+  if not public.yonetici_mi() then raise exception 'Bu işlem için yönetici yetkisi gerekir.'; end if;
+  if length(yeni_sifre) < 6 then raise exception 'Şifre en az 6 karakter olmalıdır.'; end if;
+  update auth.users
+     set encrypted_password = extensions.crypt(yeni_sifre, extensions.gen_salt('bf')),
+         updated_at = now()
+   where id = hedef;
+end;
+$$;
+
+create or replace function public.yonetici_kullanici_sil(hedef uuid) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  if not public.yonetici_mi() then raise exception 'Bu işlem için yönetici yetkisi gerekir.'; end if;
+  if hedef = auth.uid() then raise exception 'Kendi hesabınızı silemezsiniz.'; end if;
+  delete from auth.users where id = hedef;
+end;
+$$;
+
+revoke execute on function public.yonetici_sifre_degistir(uuid, text) from public, anon;
+revoke execute on function public.yonetici_kullanici_sil(uuid)        from public, anon;
+grant  execute on function public.yonetici_sifre_degistir(uuid, text) to authenticated;
+grant  execute on function public.yonetici_kullanici_sil(uuid)        to authenticated;
+
+-- 8b) KAYIT OLMA: kullanıcı adı + şifre ile yeni hesap açar (e-posta gerekmez).
+--     Yeni hesap ONAYSIZ başlar (6. bölümdeki kural). Şifre şifrelenerek saklanır.
+create or replace function public.kayit_ol(yeni_kullanici_adi text, yeni_sifre text) returns void
+language plpgsql security definer set search_path = public, extensions as $$
+declare
+  ad      text := lower(trim(yeni_kullanici_adi));
+  eposta  text;
+  yeni_id uuid := gen_random_uuid();
+begin
+  if ad !~ '^[a-z0-9._-]{3,30}$' then
+    raise exception 'Kullanıcı adı geçersiz.';
+  end if;
+  if length(coalesce(yeni_sifre, '')) < 6 then
+    raise exception 'Şifre en az 6 karakter olmalıdır.';
+  end if;
+  eposta := ad || '@kullanici.invalid';
+  if exists (select 1 from auth.users where email = eposta) then
+    raise exception 'Bu kullanıcı adı zaten alınmış.';
+  end if;
+
+  insert into auth.users (
+    instance_id, id, aud, role, email, encrypted_password, email_confirmed_at,
+    raw_app_meta_data, raw_user_meta_data, created_at, updated_at,
+    confirmation_token, recovery_token, email_change_token_new, email_change
+  ) values (
+    '00000000-0000-0000-0000-000000000000', yeni_id, 'authenticated', 'authenticated',
+    eposta, extensions.crypt(yeni_sifre, extensions.gen_salt('bf')), now(),
+    '{"provider":"email","providers":["email"]}'::jsonb,
+    jsonb_build_object('kullanici_adi', ad), now(), now(),
+    '', '', '', ''
+  );
+
+  insert into auth.identities (id, user_id, provider_id, identity_data, provider, last_sign_in_at, created_at, updated_at)
+  values (
+    gen_random_uuid(), yeni_id, yeni_id::text,
+    jsonb_build_object('sub', yeni_id::text, 'email', eposta, 'email_verified', true),
+    'email', now(), now(), now()
+  );
+end;
+$$;
+
+revoke execute on function public.kayit_ol(text, text) from public;
+grant  execute on function public.kayit_ol(text, text) to anon, authenticated;
+
+-- 9) ÖRNEK VERİ (uydurma, musteri_listesi.xlsx'ten) – tablo boşsa eklenir
+insert into public.musteriler
+  (unvan, vergi_no, sektor, mukellefiyet_turu, yetkili, telefon, eposta, aylik_ucret)
+select * from (values
+  ('Yıldız İnşaat Ltd. Şti.', '0000000001', 'İnşaat', 'Kurumlar Vergisi', 'Kemal Yıldız', '05550000001', 'yildiz@ornek-firma.example', 15000),
+  ('Akın Yapı Taahhüt A.Ş.', '0000000002', 'İnşaat', 'Kurumlar Vergisi', 'Serdar Akın', '05550000002', 'akin@ornek-firma.example', 22000),
+  ('Demirtaş İnşaat Malzemeleri', '0000000003', 'İnşaat', 'Gelir Vergisi (Bilanço)', 'Hakan Demirtaş', '05550000003', 'demirtas@ornek-firma.example', 9000),
+  ('Güneş Mimarlık ve İnşaat Ltd. Şti.', '0000000004', 'İnşaat', 'Kurumlar Vergisi', 'Elif Güneş', '05550000004', 'gunes@ornek-firma.example', 12000),
+  ('Lezzet Durağı Restoran', '0000000005', 'Gıda', 'Gelir Vergisi (İşletme)', 'Murat Kaya', '05550000005', 'kaya@ornek-firma.example', 6000),
+  ('Bereket Gıda Toptan Ltd. Şti.', '0000000006', 'Gıda', 'Kurumlar Vergisi', 'Ayşe Bereket', '05550000006', 'bereket@ornek-firma.example', 14000),
+  ('Fırın Evi Unlu Mamuller', '0000000007', 'Gıda', 'Gelir Vergisi (İşletme)', 'Osman Çelik', '05550000007', 'celik@ornek-firma.example', 5500),
+  ('Mavi Tekstil San. Tic. Ltd. Şti.', '0000000008', 'Tekstil', 'Kurumlar Vergisi', 'Zeynep Mavi', '05550000008', 'mavi@ornek-firma.example', 16000),
+  ('Moda Konfeksiyon', '0000000009', 'Tekstil', 'Gelir Vergisi (Bilanço)', 'Selin Arslan', '05550000009', 'arslan@ornek-firma.example', 8000),
+  ('Hızlı Kargo Lojistik Ltd. Şti.', '0000000010', 'Lojistik', 'Kurumlar Vergisi', 'Burak Şahin', '05550000010', 'sahin@ornek-firma.example', 13000),
+  ('Anadolu Nakliyat', '0000000011', 'Lojistik', 'Gelir Vergisi (Bilanço)', 'İsmail Öztürk', '05550000011', 'ozturk@ornek-firma.example', 7500),
+  ('Bilgi Yazılım Teknoloji A.Ş.', '0000000012', 'Bilişim', 'Kurumlar Vergisi', 'Deniz Aydın', '05550000012', 'aydin@ornek-firma.example', 18000),
+  ('Piksel Dijital Ajans Ltd. Şti.', '0000000013', 'Bilişim', 'Kurumlar Vergisi', 'Ece Yılmaz', '05550000013', 'yilmaz@ornek-firma.example', 11000),
+  ('Sağlık Eczanesi', '0000000014', 'Sağlık', 'Gelir Vergisi (Bilanço)', 'Ecz. Nur Doğan', '05550000014', 'dogan@ornek-firma.example', 8500),
+  ('Gülüş Ağız ve Diş Polikliniği', '0000000015', 'Sağlık', 'Kurumlar Vergisi', 'Dt. Cem Polat', '05550000015', 'polat@ornek-firma.example', 12500),
+  ('Oto Usta Servis', '0000000016', 'Otomotiv', 'Gelir Vergisi (İşletme)', 'Yusuf Kurt', '05550000016', 'kurt@ornek-firma.example', 5000),
+  ('Yol Otomotiv Yedek Parça Ltd. Şti.', '0000000017', 'Otomotiv', 'Kurumlar Vergisi', 'Tolga Erdem', '05550000017', 'erdem@ornek-firma.example', 10500),
+  ('Ev Dekor Mobilya', '0000000018', 'Perakende', 'Gelir Vergisi (Bilanço)', 'Fatma Koç', '05550000018', 'koc@ornek-firma.example', 7000),
+  ('Kırtasiye Dünyası', '0000000019', 'Perakende', 'Gelir Vergisi (İşletme)', 'Ali Özkan', '05550000019', 'ozkan@ornek-firma.example', 4500),
+  ('Emlak Vizyon Gayrimenkul Ltd. Şti.', '0000000020', 'Emlak', 'Kurumlar Vergisi', 'Gökhan Tekin', '05550000020', 'tekin@ornek-firma.example', 9500)
+) as v
+where not exists (select 1 from public.musteriler);
+
+
+-- Kontrol: 20 yazmalı
+select count(*) as musteri_sayisi from public.musteriler;
